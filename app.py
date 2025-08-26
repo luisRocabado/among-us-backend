@@ -32,6 +32,10 @@ CORS(app,
      methods=["GET", "POST", "OPTIONS"],
      allow_headers=["Content-Type", "Authorization", "ngrok-skip-browser-warning"])
 
+# Configurar límites para archivos grandes
+app.config['MAX_CONTENT_LENGTH'] = 2 * 1024 * 1024 * 1024  # 2GB
+app.config['UPLOAD_FOLDER'] = '/tmp'  # Para archivos temporales en Render
+
 # Configurar Supabase y OpenAI
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_ANON_KEY')
@@ -52,10 +56,60 @@ try:
     else:
         supabase = None
         logger.warning("⚠️ Supabase no configurado")
+        
 except Exception as e:
     logger.error(f"Error conectando Supabase: {e}")
     supabase = None
-
+def generate_improvement_opportunities(analysis_data, participant_data):
+    """Genera oportunidades de mejora con GPT"""
+    if not client:
+        return "Se requiere configuración de OpenAI para generar recomendaciones personalizadas."
+    
+    try:
+        scores = analysis_data.get('soft_skills_scores', {})
+        lowest_scores = sorted(scores.items(), key=lambda x: x[1])[:3]
+        
+        # Traducir habilidades para el prompt
+        skill_translations = {
+            'liderazgo': 'liderazgo',
+            'comunicacion': 'comunicación',
+            'pensamiento_critico': 'pensamiento crítico',
+            'colaboracion': 'trabajo en equipo',
+            'adaptabilidad': 'adaptabilidad',
+            'resolucion_problemas': 'resolución de problemas',
+            'inteligencia_emocional': 'inteligencia emocional',
+            'persuasion': 'persuasión'
+        }
+        
+        lowest_skills_text = ", ".join([f"{skill_translations.get(skill, skill)} ({score}/10)" for skill, score in lowest_scores])
+        
+        prompt = f"""
+        Como consultor experto en desarrollo profesional, genera recomendaciones específicas para:
+        
+        Participante: {participant_data.get('position', 'Profesional')} de {participant_data.get('age', 'N/A')} años
+        Habilidades con menor puntuación: {lowest_skills_text}
+        
+        Proporciona UN párrafo de 150-180 palabras con recomendaciones específicas, prácticas y accionables para mejorar estas habilidades en el contexto laboral. Las recomendaciones deben ser:
+        - Específicas para las áreas identificadas
+        - Aplicables en el día a día laboral
+        - Constructivas y motivadoras
+        - Personalizadas según el rol del participante
+        
+        No uses frases genéricas. Sé específico y práctico.
+        """
+        
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",  # Más económico que gpt-4
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=250,
+            temperature=0.7
+        )
+        
+        return response.choices[0].message.content
+        
+    except Exception as e:
+        logger.error(f"Error generando mejoras: {e}")
+        return "Error al generar recomendaciones personalizadas. Por favor, contacta al administrador."
 # ELIMINAR las funciones @app.before_request y @app.after_request 
 # que estaban duplicando los headers
 
@@ -89,7 +143,15 @@ def analyze_video():
     """Endpoint básico - devuelve análisis simulado"""
     try:
         logger.info("🎥 Recibiendo solicitud de análisis (modo básico)")
-        
+        # Verificar tamaño del archivo si está disponible
+        video_file = request.files.get('video')
+        if video_file and hasattr(video_file, 'content_length') and video_file.content_length:
+            if video_file.content_length > 2 * 1024 * 1024 * 1024:  # 2GB
+                return jsonify({
+                    'error': 'Archivo demasiado grande',
+                    'max_size': '2GB',
+                    'received_size': f"{video_file.content_length / (1024*1024*1024):.1f}GB"
+                }), 413
         # Validar que hay archivo
         if 'video' not in request.files:
             return jsonify({'error': 'No se encontró archivo de video'}), 400
@@ -153,6 +215,11 @@ def analyze_video():
             'backend_url': 'https://among-us-backend-uosa.onrender.com'
         }
         
+# Generar oportunidades de mejora personalizadas
+        response_data['improvement_opportunities'] = generate_improvement_opportunities(
+            response_data, participant_data
+        )
+        
         logger.info(f"✅ Análisis simulado completado para {participant_data.get('name')}")
         return jsonify(response_data)
         
@@ -172,7 +239,14 @@ def test_video_analysis():
         'timestamp': datetime.now().isoformat(),
         'version': 'render_minimal'
     })
-
+@app.route('/openai-status', methods=['GET'])
+def openai_status():
+    """Verificar estado de OpenAI"""
+    return jsonify({
+        'openai_configured': client is not None,
+        'can_generate_improvements': client is not None,
+        'timestamp': datetime.now().isoformat()
+    })
 @app.route('/')
 def home():
     """Página de inicio"""
@@ -204,9 +278,14 @@ def home():
         </div>
         
         <div class="status warning">
-            <h3>ℹ️ Modo Actual: Análisis Simulado</h3>
-            <p>El sistema devuelve datos de prueba realistas.</p>
-            <p>Para análisis real de video, se pueden agregar Whisper y OpenCV.</p>
+            <h3>ℹ️ Modo Actual: Análisis con IA</h3>
+            <p>El sistema incluye:</p>
+            <ul>
+                <li>✅ Análisis simulado de gameplay</li>
+                <li>✅ Generación de oportunidades de mejora con GPT-4</li>
+                <li>✅ Soporte para videos hasta 2GB</li>
+                <li>⚠️ Transcripción y análisis visual: En desarrollo</li>
+            </ul>
         </div>
         
         <h3>📡 Endpoints Disponibles:</h3>
@@ -215,6 +294,7 @@ def home():
             <li><code>POST /analyze-video</code> - Análisis simulado</li>
             <li><code>GET /mobile-check</code> - Verificación móvil</li>
             <li><code>POST /test-video-analysis</code> - Endpoint de prueba</li>
+            <li><code>GET /openai-status</code> - Estado de OpenAI</li>
         </ul>
         
         <h3>🎯 Ventajas actuales:</h3>
@@ -222,7 +302,7 @@ def home():
             <li>✅ Sin timeouts de ngrok</li>
             <li>✅ 99.9% uptime garantizado</li>
             <li>✅ Escalado automático</li>
-            <li>✅ Archivos grandes (200MB+)</li>
+            <li>✅ Archivos grandes (hasta 2GB)</li>
             <li>✅ HTTPS incluido</li>
             <li>✅ Cero mantenimiento</li>
         </ul>
